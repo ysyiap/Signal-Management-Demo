@@ -1,0 +1,26 @@
+---
+title: "Synthetic Sample Generator"
+author: "Yiap Yong Sheng"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## **Generate minimal synthetic sample**
+
+```{r}
+library(tibble)
+set.seed(1)
+synthetic <- tibble(
+  report_no = sprintf("r%04d", 1:50),
+  period = sample(c("2024H1","2024H2"), 50, replace=TRUE),
+  active_ingredient = sample(c("drugA","drugB","drugC"), 50, replace=TRUE),
+  dose_dose_unit = sample(c("50 Mg milligram(s)", "100 Mg milligram(s)", "200 Mg milligram(s)"), 50, replace=TRUE),
+  adr_category = sample(c("nausea","headache","rash"), 50, replace=TRUE),
+  age = sample(c("<1","1-17","18-29","30-49","50-69","70+"), 50, replace=TRUE),
+  sex = sample(c("M","F"), 50, replace=TRUE)
+)
+dir.create("data", showWarnings = FALSE)
+write.csv(synthetic, "data/npra_anon_sample.csv", row.names = FALSE)
+
+```
+
