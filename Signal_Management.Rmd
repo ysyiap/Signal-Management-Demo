@@ -1,0 +1,652 @@
+---
+title: "NPRA Signal Management"
+author: "Yiap Yong Sheng"
+date: "`r Sys.Date()`"
+format:
+  html:
+    theme: flatly        # or minty, cosmo, journal
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    number-sections: true
+  pdf:
+    toc: true
+    number-sections: true
+    geometry: margin=1in
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Project Notes**
+
+Change Input file & Output file name before running script.
+
+## **Software Libraries (R Packages)**
+
+```{r, results = 'hide'}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(rmarkdown)
+library(knitr)
+library(tinytex)
+library(janitor)
+library(openxlsx)
+library(broom)
+library(purrr)
+library(emmeans)
+```
+
+## **Loading Source (Note: replace with local path)**
+
+```{r TBC1}
+npra_list <- read.csv("/cloud/project/data/npra_anon_sample.csv")
+```
+
+## ** Data Cleaning and Standardization**
+
+Unifies column names, date formats, and text casing to maintain structural consistency and analytical accuracy, minimizing mismatches during joins, filters, or group operations across the pipeline.
+
+*a. Normalize Column Names*
+
+In this section, we change the column names into snake case for convenience.
+
+```{r}
+npra_list <- npra_list %>%
+  clean_names()
+```
+
+*b. Standardize Period, Product Names, Dose Formats*
+
+If period starts with Jan, remove all input before last space in period column (YYYY remaining) and add H1 (1st half), otherwise add H2.
+
+Convert product name and adr category to Title case, where only the first letter of each word is capitalized.
+
+Change dosage format to remove the duplicated dose unit at the end of the data.
+
+```{r}
+clean_list <- npra_list %>%  
+  mutate( 
+    period = ifelse(grepl("Jan", period),
+                      paste0(sub(".* ", "", period), "H1"),
+                      paste0(sub(".* ", "", period), "H2")),
+    active_ingredient = str_to_title(active_ingredient),
+    adr_category = str_to_title(adr_category),
+    dose_unit = sub(" [^ ]*$", "", dose_dose_unit)
+    ) 
+```
+
+## **Filter non-ADR reports and deduplicate**
+
+Removes irrelevant or erroneous entries such as product-handling mistakes and duplicates to isolate true adverse drug reactions, preserving dataset integrity for valid signal analysis.
+
+```{r}
+filt_list <- clean_list %>%
+  filter(adr_category !="Product Issue / Human Error") %>%
+  distinct(active_ingredient, report_no, dose_dose_unit, adr_category, .keep_all = TRUE)
+```
+
+*a. Summary counts per Drug and ADR*
+
+Generates aggregated counts of each drug–ADR pair to form the base table used in disproportionality calculations, ensuring that subsequent statistical comparisons are grounded in accurate frequency data.
+
+```{r}
+fl_summ <- filt_list %>%
+  group_by(active_ingredient, adr_category) %>%
+  summarise(adr_count = n(), .groups = "drop_last") %>%
+  mutate(total_adr = sum(adr_count)) %>%
+  arrange(desc(total_adr), desc(adr_count))
+```
+
+*b. Sanity check*
+
+Validates that summarized counts align with the filtered dataset total, acting as a data quality safeguard before running higher-level signal-detection computations.
+
+```{r}
+tally <- fl_summ %>%
+  ungroup() %>%
+  summarise(total_all = sum(adr_count))
+```
+
+## **Ranking ADR frequency with top 10 drugs**
+
+Highlights the most frequently reported drugs and their common reactions, focusing the analysis on datasets with sufficient volume to support meaningful statistical inference and visualization.
+
+a. Top 10 API by report volume.
+
+```{r}
+top10_api <- filt_list %>%
+  count(active_ingredient, name = "total_adr", sort = TRUE) %>%
+  slice_head(n = 10)
+```
+
+b. ADR breakdown for top drugs.
+
+```{r}
+adrc <- filt_list %>%
+  filter(active_ingredient %in% top10_api$active_ingredient) %>%
+  count(active_ingredient, adr_category, name = "adr_count", sort = TRUE) %>%
+  group_by(active_ingredient)
+```
+
+c. Focus on ADRs with frequency > 4% within each drugs.
+
+```{r}
+adr_freq <- adrc %>%
+  full_join(top10_api, by = "active_ingredient") %>%
+  mutate(freq = round(adr_count*100/total_adr)) %>%
+  filter(freq > 4) %>%
+  arrange(desc(total_adr), desc(freq))
+```
+
+## **Signal Detections (ROR, PRR, IC calculations)**
+
+Quantifies the strength of association between drugs and reported ADRs using established disproportionality metrics, identifying signals that occur more often than expected under random distribution.
+
+a. Total reports used in analysis
+
+```{r}
+total_all <- nrow(filt_list)
+```
+
+b. Construct Contingency Table with each ADR - drug pair
+
+```{r}
+dpa_table <- adr_freq %>%
+  rowwise() %>%
+  mutate(
+    a = adr_count,
+    b = total_adr - adr_count,
+    c = sum(fl_summ$adr_count[
+      fl_summ$adr_category == adr_category & 
+        fl_summ$active_ingredient != active_ingredient]),
+    d = total_all - a - b - c,
+    N = total_all
+  )
+```
+
+c. Reporting Odd Ratio and Confidence Interval
+
+```{r}
+dpa_table <- dpa_table %>%
+  rowwise() %>%
+  mutate(
+    ROR = (a * d)/(b * c),
+    logROR = log(ROR),
+    se_logROR = sqrt(1/a + 1/b + 1/c + 1/d),
+    ROR_lower = exp(logROR - 1.96 * se_logROR),
+    ROR_upper = exp(logROR + 1.96 * se_logROR)
+  )
+```
+
+d. Proportional Reporting Ratio and Confidence Interval
+
+```{r}
+dpa_table <- dpa_table %>%
+  rowwise() %>%
+  mutate(
+    PRR = (a/(a + b))/(c/(c + d)),
+    logPRR = log(PRR),
+    se_logPRR = sqrt(1/a - 1/(a + b) + 1/c - 1/(c + d)),
+    PRR_lower = exp(logPRR - 1.96 * se_logPRR),
+    PRR_upper = exp(logPRR + 1.96 * se_logPRR)
+  )
+```
+
+e. Information Component and Lower Bound (IC025)
+
+```{r}
+dpa_table <- dpa_table %>%
+  rowwise() %>%
+  mutate(
+    IC = log2((a * N)/((a + b) * (a + c))),
+    varIC = (1/a + (1/(a + b)) + (1/(a + c)) + 1/d),
+    seIC = sqrt(varIC),
+    IC025 = IC - 1.96 * seIC,
+    IC975 = IC + 1.96 * seIC
+  )
+```
+
+f. Flagged Signals Summary
+
+```{r}
+dpa_summary <- dpa_table %>%
+  mutate(
+    Signal_ROR = ROR_lower > 1,
+    Signal_PRR = PRR_lower > 1,
+    Signal_IC = IC025 > 0,
+    Signal = any(ROR_lower > 1, PRR_lower > 1, IC025 > 0) & 
+      adr_count > 3
+  ) %>%
+  ungroup() %>%
+  select(active_ingredient, adr_category, 
+         adr_count, ROR_lower, 
+         PRR_lower, IC025, Signal)
+```
+
+## **Visualization**
+
+Translates numerical signal results into interpretable bar charts to enable rapid review of potential safety concerns by non-technical audiences.
+
+```{r}
+DPA_Signals <- ggplot(data = dpa_summary %>%
+          filter(Signal == TRUE),
+          mapping = aes(x = reorder(active_ingredient, -adr_count), 
+                        y = adr_count, fill = adr_category)) +
+          geom_col(position = "dodge") +
+          labs(x = "ADR", 
+               y = "Count", 
+               title = "Disproportionate Signals", 
+               subtitle = "2022H1 - 2024H2", 
+               fill = "ADR") +
+          coord_flip()
+
+```
+
+Saving
+
+```{r}
+signal_file <- "DPA_Signals.png"
+ggsave(signal_file, plot = DPA_Signals, width = 8, height = 5, dpi = 300)
+```
+
+## **Optional - removing temp objects to save memory**
+
+Clears intermediate datasets and variables after use to conserve memory and maintain computational efficiency within long analytical sessions.
+
+```{r}
+rm(adr_freq, adrc, clean_list, npra_list, tally, top10_api)
+```
+
+## **Risk Factor Analysis - Age**
+
+Assesses whether patient age influences the likelihood of experiencing specific ADRs through logistic regression, helping identify age-related safety patterns across drugs.
+
+**a. Inner Join**
+
+By inner joining the filt_list with dpa_table, we can ensure that all the required entries are included in the risk factor analysis later on.
+
+```{r}
+rfa <- filt_list %>%
+  inner_join(dpa_table, by = c("active_ingredient", "adr_category"))
+```
+
+**b. Cleaning**
+
+In this section we are removing the N/A's and the NULL's and converting those age < 1 year into 0 years.
+
+```{r}
+age_clean <- rfa %>%
+  filter(!is.na(age) & age != "N/A" & age != "NULL") %>%
+  mutate(age = ifelse(grepl("^[0-9]+$", age), age, "0")) %>%
+  mutate(age = as.integer(age))
+```
+
+**c. Grouping**
+
+In order to perform the Logistic Regression, we need to split the list into API-ADR pairs.
+
+The table below summarizes the number of 0 & 1 flags each pairs have as a reference to the Logistic Regression later.
+
+```{r}
+flag_summary <- suppressWarnings(age_clean %>%
+  group_by(active_ingredient) %>%
+  group_modify(~ {
+    df <- .x
+    adr_list <- unique(df$adr_category)
+    map_dfr(adr_list, function(current_adr) {
+      df %>%
+        mutate(adr_flag = factor(ifelse(adr_category == current_adr, 1, 0))) %>%
+        count(adr_flag, name = "n") %>%
+        tidyr::pivot_wider(names_from = adr_flag, values_from = n, values_fill = 0) %>%
+        mutate(active_ingredient = unique(df$active_ingredient),
+               adr_tested = current_adr)
+    })
+  }) %>%
+  ungroup()
+)
+```
+
+**d. Logistic Regression**
+
+Here, we do what we did in the previous step, to separate each drug-adr pairs into smaller groups, and run logistic regression on each of them, with the formula [if drug-adr of each row corresponds to the assigned drug-adr of the specific group, flag entry as 1, otherwise flag entry as 0].
+
+```{r}
+cor_age <- age_clean %>%
+  group_by(active_ingredient) %>%
+  group_modify(~ {
+    df <- .x
+    adr_list <- unique(df$adr_category)
+    map_dfr(adr_list, function(current_adr) {
+      flagged <- df %>%
+        mutate(adr_flag = factor(ifelse(adr_category == current_adr, 1, 0)))
+        
+        model <- glm(adr_flag ~ age, data = flagged, family = binomial)
+        
+        tidy_model <- broom::tidy(model) %>%
+          filter(term == "age") %>%   
+          mutate(
+            adr_category = current_adr,
+            odds_ratio = exp(estimate), 
+            pct_change = (odds_ratio - 1) * 100,
+            effect_direction = case_when(
+              pct_change > 0 ~ paste0("+", round(pct_change, 2), "% increased odds per year"),
+              pct_change < 0 ~ paste0(round(pct_change, 2), "% decreased odds per year"),
+              TRUE ~ "No effect"
+            ),
+            p_adj = round(p.adjust(p.value, method = "fdr"), 2),
+            signif = case_when(
+              p_adj < 0.001 ~ "***",
+              p_adj < 0.01  ~ "**",
+              p_adj < 0.05  ~ "*",
+              TRUE ~ "ns"
+            ),
+          ) %>%
+          select(adr_category, , odds_ratio, p_adj, effect_direction, signif)
+
+      return(tidy_model)
+        
+    })
+  }) %>%
+  ungroup()
+```
+
+**e. Forest Plot**
+
+```{r}
+
+sig_results <- cor_age %>%
+  filter(signif != "ns") %>%
+  mutate(pair = paste(active_ingredient, adr_category, sep = " - "))
+
+if(nrow(sig_results) == 0) {
+  agecor <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "No significant findings",
+             size = 6, color = "grey40") +
+    theme_void()
+} else {
+agecor <- ggplot(sig_results, aes(x = odds_ratio, 
+                        y = reorder(pair, odds_ratio),   
+                        color = odds_ratio > 1)) +       
+  geom_point(size = 3) +                                
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +    
+  scale_x_log10() +                                     
+  scale_color_manual(values = c("blue", "red"), 
+                     labels = c("Lower with age", "Higher with age")) +
+  labs(
+    title = "Drug–ADR Pairs and Age",
+    subtitle = "Significant Correlations (Logistic Regression)",
+    x = "Odds Ratio (log scale)",
+    y = "Drug - ADR Pair",
+    color = "Effect direction"
+  ) +
+  theme_minimal(base_size = 12)
+}
+```
+
+Saving
+```{r}
+age_file <- "Age_Correlation.png"
+ggsave(age_file, plot = agecor, width = 8, height = 5, dpi = 300)
+```
+
+## **Risk Factor Analysis - Dose Strength**
+
+Examines whether differing dosage strengths are associated with changes in ADR risk, clarifying potential dose–response relationships through comparative modeling.
+
+**a. Cleaning**
+```{r}
+dose_clean <- rfa %>%
+  filter(dose_unit != "NULL Mg", dose_unit != "NULL DF dosage")
+```
+
+**b. Logistic Regression**
+
+```{r}
+cor_dose <- dose_clean %>%
+  group_by(active_ingredient) %>%
+  group_modify(~ {
+    df <- .x
+    adr_list <- unique(df$adr_category)
+
+    map_dfr(adr_list, function(current_adr) {
+      flagged <- df %>%
+        mutate(
+          adr_flag = ifelse(adr_category == current_adr, 1, 0),
+          dose_num  = as.numeric(str_extract(dose_unit, "\\d+\\.*\\d*")),   
+          dose_unit = str_extract(dose_unit, "Mg|ml|DF"),
+          min_dose = ifelse(dose_unit %in% c("Mg", "ml"),
+                      min(dose_num, na.rm = TRUE),
+                      NA_real_),  # DF will get NA here
+          dose_std = case_when(
+            dose_unit == "DF" & dose_num == 1 ~ min_dose,
+            dose_unit == "DF" & dose_num == 2 ~ 2 * min_dose,
+            TRUE ~ dose_num)
+        )
+
+      model <- glm(adr_flag ~ factor(dose_std), 
+                   data = flagged, 
+                   family = binomial) 
+
+      pairwise <- emmeans(model, pairwise ~ factor(dose_std), type = "response")$contrasts %>%
+        as.data.frame() %>%
+        mutate(
+         adr_category = current_adr,
+         odds_ratio = odds.ratio,
+         contrast_clean = str_replace_all(contrast, "dose_std", ""),
+         dose_vals = str_split(contrast_clean, " / "),
+         dose_low = map_chr(dose_vals, 1),
+         dose_high = map_chr(dose_vals, 2),
+         signif = case_when(
+                    p.value < 0.001 ~ "***",
+                    p.value < 0.01  ~ "**",
+                    p.value < 0.05  ~ "*",
+                    TRUE ~ "ns"
+                  ),
+        Interpretation = case_when(
+          odds_ratio > 1 & p.value < 0.05 ~ 
+            paste0(dose_low, " has higher odds of ", 
+                   current_adr, " (OR=", round(odds_ratio, 2), 
+                  ", p=", signif(p.value, 3), ") than ", dose_high),
+          odds_ratio < 1 & p.value < 0.05 ~ 
+            paste0(dose_high, " has higher odds of ", 
+                   current_adr, " (OR=", round(odds_ratio, 2), 
+                   ", p=", signif(p.value, 3), ") than ", dose_low),
+          TRUE ~ 
+            paste0(dose_low, " vs ", dose_high, 
+                   ": no significant difference (OR=", 
+                   round(odds_ratio, 2), ", p=", signif(p.value, 3), ")")
+          )
+        ) %>%
+      return(pairwise)
+    })
+  }) %>%
+  ungroup()
+
+```
+
+**c. Forest Plot**
+
+```{r}
+sig_results_dose <- cor_dose %>%
+  filter(signif != "ns") %>%
+  mutate(pair = paste(adr_category, contrast_clean, sep = " - "))
+
+if(nrow(sig_results_dose) == 0) {
+  dosecor <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "No significant findings",
+             size = 6, color = "grey40") +
+    theme_void()
+} else {
+  dosecor <- ggplot(sig_results_dose, aes(x = odds_ratio, 
+                        y = reorder(pair, odds_ratio),   
+                        color = odds_ratio > 1)) +       
+  geom_point(size = 3) +                                
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +    
+  scale_x_log10() +  
+  facet_wrap(~ active_ingredient, scales = "free_y") +
+  scale_color_manual(values = c("blue", "red"), 
+                     labels = c("Lower odds", "Higher odds")) +
+  labs(
+    title = "Drug–ADR Pairs and Dose Strength",
+    subtitle = "Significant Correlations (Logistic Regression)",
+    x = "Odds Ratio (log scale)",
+    y = "Drug - ADR Pair",
+    color = "Odds of ADR"
+  ) +
+  theme_minimal(base_size = 12)
+}
+
+```
+
+Saving
+
+```{r}
+dose_file <- "Dose_Correlation.png"
+ggsave(dose_file, plot = dosecor, width = 8, height = 5, dpi = 300)
+```
+
+## **Risk Factor Analysis - Gender**
+
+Evaluates sex-based variation in ADR occurrence using logistic regression to uncover gender-related pharmacovigilance signals and potential biological or reporting biases.
+
+**a. Cleaning**
+
+```{r}
+sex_clean <- rfa %>%
+  filter(sex != "NULL", sex != "Null", sex != "Unknown")
+```
+
+**b. Logistic Regression**
+
+```{r}
+cor_sex <- sex_clean %>%
+  group_by(active_ingredient) %>%
+  group_modify(~ {
+    df <- .x
+    adr_list <- unique(df$adr_category)
+
+    map_dfr(adr_list, function(current_adr) {
+      flagged <- df %>%
+        mutate(adr_flag = ifelse(adr_category == current_adr, 1, 0))
+
+      model <- glm(adr_flag ~ factor(sex), data = flagged, family = binomial)
+
+      tidy_model <- broom::tidy(model) %>%
+        filter(term != "(Intercept)") %>%
+        mutate(
+          odds_ratio = exp(estimate),
+          adr_category = current_adr,
+          pct_change = (odds_ratio - 1) * 100,
+          term_clean = str_remove(term, "factor\\(sex\\)"),
+          effect_direction = case_when(
+              pct_change > 0 ~ paste0(term_clean, " has ",  "+", round(pct_change, 2), " % odds"),
+              pct_change < 0 ~ paste0(term_clean, " has ", round(pct_change, 2), " % odds"),
+              TRUE ~ "No effect"
+              ),
+          signif = case_when(
+                    p.value < 0.001 ~ "***",
+                    p.value < 0.01  ~ "**",
+                    p.value < 0.05  ~ "*",
+                    TRUE ~ "ns"
+                  ),
+          ) %>%
+        select(adr_category, term_clean, odds_ratio, p.value, effect_direction, signif)
+
+      return(tidy_model)
+    })
+  }) %>%
+  ungroup()
+
+```
+
+**c. Forest Plot**
+
+```{r}
+sig_results_sex <- cor_sex %>%
+  filter(signif != "ns") %>%
+  mutate(pair = paste(adr_category, term_clean, sep = " - "))
+
+if(nrow(sig_results_sex) == 0) {
+  sexcor <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "No significant findings",
+             size = 6, color = "grey40") +
+    theme_void()
+} else {
+sexcor <- ggplot(sig_results_sex, aes(x = odds_ratio, 
+                        y = reorder(pair, odds_ratio),   
+                        color = odds_ratio > 1)) +       
+  geom_point(size = 3) +                                
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +    
+  scale_x_log10() +  
+  scale_color_manual(values = c("blue", "red"), 
+                     labels = c("Lower odds", "Higher odds")) +
+  facet_wrap(~ active_ingredient, scales = "free_y") +
+  labs(
+    title = "Drug–ADR Pairs and Gender",
+    subtitle = "Significant Correlations (Logistic Regression)",
+    x = "Odds Ratio (log scale)",
+    y = "Drug - ADR Pair",
+    color = "Odds of ADR"
+  ) +
+  theme_minimal(base_size = 9)
+}
+```
+Saving
+
+```{r}
+sex_file <- "Gender_Correlation.png"
+ggsave(sex_file, plot = sexcor, width = 8, height = 5, dpi = 300)
+```
+
+## **Write data (replace with desired output name) **
+
+Consolidates all processed tables and plots into a single Excel workbook, ensuring results are documented, portable, and easily reviewed by auditors or collaborators.
+
+```{r TBC2}
+wb <- createWorkbook()
+addWorksheet(wb, "Filtered List")
+writeData(wb, "Filtered List", filt_list)
+
+addWorksheet(wb, "DPA Calculations")
+writeData(wb, "DPA Calculations", dpa_table)
+
+addWorksheet(wb, "DPA Summary")
+writeData(wb, "DPA Summary", dpa_summary)
+
+addWorksheet(wb, "DPA Chart")
+insertImage(wb, "DPA Chart", file = signal_file, 
+            width = 8, height = 5, startCol = 2, startRow = 2)
+
+addWorksheet(wb, "RFA Age")
+writeData(wb, "RFA Age", cor_age)
+
+addWorksheet(wb, "Age Chart")
+insertImage(wb, "Age Chart", file = age_file, 
+            width = 8, height = 5, startCol = 2, startRow = 2)
+
+addWorksheet(wb, "RFA Dose")
+writeData(wb, "RFA Dose", cor_dose)
+
+addWorksheet(wb, "Dose Chart")
+insertImage(wb, "Dose Chart", file = dose_file, 
+            width = 8, height = 5, startCol = 2, startRow = 2)
+
+addWorksheet(wb, "RFA Gender")
+writeData(wb, "RFA Gender", cor_sex)
+
+addWorksheet(wb, "Gender Chart")
+insertImage(wb, "Gender Chart", file = sex_file, 
+            width = 8, height = 5, startCol = 2, startRow = 2)
+
+saveWorkbook(wb, "npra_anon_sample_result.csv", overwrite = TRUE)
+```
