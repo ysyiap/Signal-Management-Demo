@@ -1,0 +1,2 @@
+# Signal-Management-Demo---DPA-Risk-Analysis-Pipeline
+My first data analytics project — a capstone submission for the Google Data Analytics Professional Certificate. Developed by a Regulatory Affairs / Pharmacovigilance Pharmacist, this project demonstrates the use of R for automating adverse drug reaction (ADR) signal detection, risk-factor analysis, and data visualization using anonymized datasets.
