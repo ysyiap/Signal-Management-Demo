@@ -47,7 +47,7 @@ signal-management-demo/
   - npra_anon_sample.csv     # Synthetic dataset used for example run
   - npra_anon_sample_result.csv # Synthetic result from generated dataset
 - docs/
-  - npra_analysis.html       # Knitted report for viewing via GitHub Pages
+  - Signal_Management.html       # Knitted report in html
 
  ---
  
