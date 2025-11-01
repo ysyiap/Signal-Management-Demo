@@ -1,4 +1,4 @@
-# Signal-Management-Demo---DPA-Risk-Analysis-Pipeline
+# Signal-Management-Demo
 
 This repository demonstrates an **adverse drug reaction (ADR) signal management workflow** originally developed for internal post-marketing pharmacovigilance, adapted here with **synthetic, anonymized data** for educational and reproducibility purposes.
 It is also my first data analytics project - a capstone submission for the Google Data Analytics Professional Certificate.
